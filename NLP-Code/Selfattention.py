@@ -39,4 +39,3 @@ class MHA(nn.Module):
         return attention, output
     
 
-        
