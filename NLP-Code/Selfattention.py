@@ -5,8 +5,11 @@ import numpy as np
 
 class MHA(nn.Module):
     def __init__( self, num_head, dimension_v, dimension_k, d_k, d_v, d_o):
-        super.__init__()
+        super().__init__()
         self.num_head=num_head
+        self.d_k=d_k
+        self.d_v=d_v
+        self.d_o=d_o
         self.dimension_v=dimension_v
         self.dimension_k=dimension_k
         self.fc_k=nn.Linear(dimension_k, num_head*d_k, False)
@@ -24,7 +27,7 @@ class MHA(nn.Module):
         k=self.fc_k(k)
         v=self.fc_v(v)
 
-        q=q.view(batch, n_q, self.num_head, self.d_q).permute(2, 0, 1, 3).contiguous().view(-1, n_q, self.d_q)
+        q=q.view(batch, n_q, self.num_head, self.d_k).permute(2, 0, 1, 3).contiguous().view(-1, n_q, self.d_k)
         k=k.view(batch, n_k, self.num_head, self.d_k).permute(2, 0, 1, 3).contiguous().view(-1, n_k, self.d_k)
         v=v.view(batch, n_v, self.num_head, self.d_v).permute(2, 0, 1, 3).contiguous().view(-1, n_v, self.d_v)
 
@@ -38,4 +41,19 @@ class MHA(nn.Module):
         output=self.fc_o(output)
         return attention, output
     
+
+batch=10
+num_head=8
+n_q, n_k, n_v= 2, 4, 4
+dimension_q, dimension_k, dimension_v=128, 128, 64
+d_k, d_v, d_o= 16 , 16, 8
+q=torch.rand(batch, n_q, dimension_q)
+k=torch.rand(batch, n_k, dimension_k)
+v=torch.rand(batch, n_v, dimension_v)
+mask=torch.full((batch,n_q,n_k),-np.inf)
+mask=torch.triu(mask)
+mha = MHA(num_head, dimension_v, dimension_k, d_k, d_v, d_o)
+attention, output = mha(q, k, v, mask)
+print(attention.size(), output.size())
+
 
