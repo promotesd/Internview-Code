@@ -1,0 +1,53 @@
+\documentclass[UTF8]{ctexart}
+\usepackage{mathtools,wallpaper}
+\usepackage{t1enc}
+\usepackage{pagecolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{amssymb}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{float}
+
+
+
+\begin{document}
+
+\section{Normalization常用归一化公式}
+
+\subsection{Instance Normalization}
+实例归一化
+
+对于一个输入特征 $\mathbf{x}$（通常是一个多通道的特征图），\texttt{InstanceNorm} 的计算过程如下：
+\begin{equation}
+    \hat{x}_{i,c}
+    = \frac{x_{i,c} - \mu_c}{\sigma_c + \varepsilon} \times \gamma_c + \beta_c
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item \texttt{x(i,c)} 是通道 $c$ 处的特征值。
+    \item $\mu_c$ 是该通道的均值：
+    \begin{equation}
+        \mu_c = \frac{1}{H \times W}
+        \sum_{h=1}^{H} \sum_{w=1}^{W} x_{i,c,h,w}
+    \end{equation}
+    \item $\sigma_c$ 是该通道的标准差：
+    \begin{equation}
+        \sigma_c = \sqrt{
+            \frac{1}{H \times W}
+            \sum_{h=1}^{H} \sum_{w=1}^{W}
+            \bigl(x_{i,c,h,w} - \mu_c\bigr)^2
+        }
+    \end{equation}
+    \item $\gamma_c$ 和 $\beta_c$ 是可学习的缩放和平移参数。
+    \item $\varepsilon$ 是一个小的常数，用于防止除零错误。
+\end{itemize}
+
+\texttt{InstanceNorm} 的归一化计算是针对每个样本的每个通道单独进行的，
+与 \texttt{BatchNorm} 不同，它不依赖于 \texttt{mini-batch} 维度。
+
+
+
+\end{document}
