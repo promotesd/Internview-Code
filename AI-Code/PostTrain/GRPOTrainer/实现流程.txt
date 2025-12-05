@@ -1,0 +1,371 @@
+我会直接给你一个**“拆代码→实现顺序”的路线图**，按层次来，不是按文件顺序来。否则一眼上去全是 GSPO / DAPO / vLLM / CHORD / liger / async，肯定会爆炸。
+
+你可以把这份 `GRPOTrainer` 想成下面几层（从核心到花活）：
+
+1. **核心 GRPO 算法链路**（必须）：
+
+   * rollout：生成 G 个回答
+   * reward：对每个回答打分
+   * advantage：组内标准化
+   * loss：per-token ratio + clipped objective + KL
+2. **multi-step / 重用 rollouts / sampler 逻辑**（GRPO 里的 μ）
+3. **动态采样 / DAPO / dynamic_num_samples**
+4. **sequence parallel / padding_free / 多模态支持**
+5. **vLLM rollout IS 校正 / CHORD / liger kernel / async / logging 花活**
+
+下面我按**建议实现顺序**来拆，每一步告诉你：
+
+* 需要先搞定哪些函数
+* 哪些可以先删掉 / stub / 返回默认值
+* 怎样验证这一层是对的
+
+---
+
+## Step 0：先瘦身 —— 明确你**不打算先实现**的东西
+
+你现在的目标是：**先把 GRPO 本体走通**，不是一开始就复刻 Swift 这个商业级 trainer 的所有 feature。所以我建议你**在自己工程里新建一个简化版 `MyGRPOTrainer`**，然后：
+
+先**统统当作“不实现”**的东西（后面当 bonus）：
+
+* `dynamic_sample` / `_dynamic_sampling` / `compute_std`
+* `dynamic_num_samples` 模式（跟 multi-turn & server 有关）
+* `sequence_parallel` / `_get_per_token_logps_and_entropies_sp`
+* `padding_free` 模式（`template.padding_free=True`）
+* `rollout_importance_sampling_mode` 相关的一大堆：
+
+  * `_apply_rollout_importance_sampling`
+  * `_compute_rollout_offpolicy_metrics`
+  * `_compute_is_correction_metrics`
+* `liger_loss` 整块：`compute_liger_loss` / `_prepare_liger_loss`
+* CHORD：`chord_sft_dataset` / `compute_chord_loss` / `_prepare_chord_dataset`
+* async：`executor` / `async_generate` / `_queue` / `train_queue` / `eval_queue` 全部先不要
+* `offload_context` / `offload_model` / `offload_optimizer` 也可以先砍掉
+
+**操作建议：**
+
+* 在新类里，先只拷核心逻辑相关的函数，别整份 copy：
+
+  * `__init__` 中也可以先把 `self._prepare_liger_loss()`、`self._prepare_chord_dataset()` 这些 call 注释掉。
+* 所有你暂时不用的分支直接写
+
+  ```python
+  assert not self.dynamic_sample  # or raise NotImplementedError
+  ```
+
+  这样保证你训练时不会悄悄走到你没实现的分支。
+
+---
+
+## Step 1：搭骨架 —— 让 `training_step` 能跑一个最小闭环（不管 loss 合不合理）
+
+这一层的目标：**training_step 能 forward + backward + optimizer.step，没有 error**。不用完全是 GRPO，只要跑得通。
+
+### 1.1 只保留最小的 `__init__` 路线
+
+在你的 `GRPOTrainer.__init__` 里，优先保留这些：
+
+* `self.args = args`
+* `self.is_multimodal = model.model_meta.is_multimodal`（如果你现在是纯文本，可以直接 `self.is_multimodal = False`）
+* `kwargs['data_collator'] = identity_data_collator`
+* `self.model_kwarg_keys = inspect.signature(...).parameters.keys()`
+* `_prepare_algorithm_params()`（但里面只留最基础的参数）
+* `super().__init__(model, ref_model, *_args, **kwargs)`（HFGRPOTrainer / Trainer 的 init）
+* `_prepare_rewards(...)`
+* `_prepare_metrics()`
+* `set_seed(args.seed, device_specific=True)`
+* `self.model_accepts_loss_kwargs = False`
+* `self._step = 0`
+* `self._buffered_inputs = None`
+
+其他花活（vLLM、PtEngine、CHORD、liger、sequence_parallel、async generate）**先不要**。
+
+### 1.2 实现一个最简单 `_prepare_inputs`
+
+你可以只实现「训练模式」里的最核心逻辑（甚至一开始可以先不做 μ 次重用）：
+
+```python
+def _prepare_inputs(self, generation_batch):
+    # 最简单版本：每个 step 都重新 rollout 一次
+    inputs = self._generate_and_score_completions(generation_batch)
+    # 假设 steps_per_generation = 1
+    return inputs[0]
+```
+
+等后面你再把「buffer + num_iterations」加回来。
+
+---
+
+## Step 2：Rollout + Reward + Encode（GRPO 的前半段）
+
+目标：给定一批 prompts，能做到：
+
+1. 生成 G 个回答（每条样本变成多条）
+2. 对每个回答打分（reward）
+3. 用模板 encode 成 token 张量、mask
+4. 预计算 old/ref 的 per-token-logprob
+
+对应代码路径：
+
+* `_generate_and_score_completions`
+* `_generate_completions`
+* `_score_completions` + `_compute_rewards_per_func`
+* `_prepare_batch_inputs`
+
+### 2.1 `_generate_completions` —— 你可以写成极简版
+
+不需要 engine / multi-turn，最小版本：
+
+```python
+def _generate_completions(self, inputs):
+    # inputs: List[dict]，每个里面有 'messages'
+    # 你可以在这一步把 messages 用 tokenizer + model.generate 转成 completions
+    # 然后写回 inputs[i]['messages'][-1]['content']
+    ...
+    return inputs
+```
+
+在 Swift 这版里它用 `self.template` + `unwrap_model_for_generation`，你可以直接照它逻辑，但先只支持单轮对话和 transformers 自带的 generate。
+
+### 2.2 `_score_completions` & `_compute_rewards_per_func`
+
+这两块已经很清晰了：
+
+* `_score_completions` 负责 `gather`，你可以先在单机上把 `gather` 替换成 identity；
+* `_compute_rewards_per_func` 是真正调用 reward 函数的地方：
+
+```python
+completions = [inp['messages'][-1]['content'] for inp in inputs]
+...
+output_reward_func = reward_func(completions, **reward_kwargs)
+rewards_per_func[:, i] = torch.tensor(output_reward_func, ...)
+```
+
+自己实现时可以：
+
+* 先强制只支持一个 `reward_func`；
+* 不用 `reward_model_plugin`；
+* 路径就是：`reward_fn(completions)` → `[len(inputs)]` 的 tensor。
+
+### 2.3 `_prepare_batch_inputs` —— 把 rollout 结果变成训练 batch
+
+这一段是**非常关键**的，因为它决定了你后续 loss 的输入格式。建议按这个顺序搞懂并实现：
+
+1. **先理解结构：**
+
+```python
+gas_chunks = self.split_by_mini_batches(inputs)
+ga_batch_encoded_inputs = []
+for batch in gas_chunks:
+    with self._template_context(template):
+        for data in batch:
+            if 'response_token_ids' in data and data['response_token_ids']:
+                ...
+            # 把 messages 中的最后一个 assistant 回复替换成 token_ids
+        batch_encoded_inputs = [template.encode(data, return_length=True) for data in batch]
+        batch_encoded_inputs = to_device(template.data_collator(batch_encoded_inputs), self.model.device)
+```
+
+也就是说：
+
+* 对每个 mini-batch（gas chunk），
+* 用 `template.encode` 统一编码成 `input_ids`, `labels` 等；
+* `labels` 里非 loss 的位置是 -100。
+
+2. **算 completion_mask / logits_to_keep：**
+
+```python
+labels = batch_encoded_inputs.pop('labels')
+logits_to_keep = (labels.shape[-1] - (torch.ne(labels, -100).int().argmax(-1))).max().item()
+extra_kwargs = {
+    'completion_mask': labels[:, -logits_to_keep:] != -100,
+    'truncated_mask': torch.tensor([...]),
+    'logits_to_keep': logits_to_keep,
+}
+```
+
+这段很精髓：
+
+* `labels` 最开始是 `[B, T]`，`-100` 表示不算 loss 的位置；
+* 通过 `logits_to_keep` 只截出「从第一个有效 label 开始到最后」的这一段；
+* `completion_mask` 就是在这段里的「哪些是 completion token」。
+
+3. **计算 old/ref logprobs：**
+
+```python
+with torch.no_grad():
+    batch_encoded_inputs['old_per_token_logps'] = (
+        self._get_per_token_logps_and_entropies(self.model, batch_encoded_inputs)[0])
+    if self.beta == 0.0:
+        ref_per_token_logps = None
+    elif self.ref_model is not None:
+        ref_per_token_logps = self._get_per_token_logps_and_entropies(self.ref_model, batch_encoded_inputs)[0]
+    else:
+        with self.null_ref_context():
+            ref_per_token_logps = self._get_per_token_logps_and_entropies(self.model, batch_encoded_inputs)[0]
+    batch_encoded_inputs['ref_per_token_logps'] = ref_per_token_logps
+```
+
+你在自己实现时可以先做一个 **最简单版本**：
+
+* 不考虑 padding_free；
+* `self._get_per_token_logps_and_entropies` 只支持单机单模态、`importance_sampling_level='token'`。
+
+只要这几个 key 正确塞进 `batch_encoded_inputs`：
+
+* `input_ids`
+* `attention_mask`
+* `logits_to_keep`
+* `completion_mask`
+* `old_per_token_logps`
+* `ref_per_token_logps`
+* `advantages`（下一步加）
+
+就已经把「GRPO 的数据准备阶段」完成了。
+
+---
+
+## Step 3：优势函数 `_compute_advantages` —— 真正实现 GRPO 中的 “Group Relative”
+
+现在你已经有了：
+
+* 每条样本的 reward：`rewards_per_func` / `rewards`
+* 每个 prompt 有 G 个 completion：`self.num_generations`
+* encode 好的 batch：`batch_encoded_inputs`
+
+接下来在 `_compute_advantages` 里做三件事：
+
+1. 聚合 reward：
+
+   ```python
+   rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)  # [N]
+   ```
+
+2. 按 group  reshape：
+
+   ```python
+   grouped_rewards = rewards.view(-1, self.num_generations)  # [B, G]
+   group_mean = grouped_rewards.mean(dim=1)                  # [B]
+   group_mean = group_mean.repeat_interleave(self.num_generations)  # [N]
+   advantages = rewards - group_mean
+   ```
+
+3. 可选：组内标准化 / batch 标准化：
+
+   ```python
+   if self.scale_rewards == 'group':
+       std = grouped_rewards.std(dim=1).repeat_interleave(K)
+       advantages = advantages / (std + 1e-4)
+   ```
+
+然后在 `_generate_and_score_completions` 里：
+
+* 把 `advantages` 写进每条 `inputs`；
+* 再按 batch 写进 `batch_encoded_inputs['advantages']`。
+
+到这一步，你已经把**论文里的 (r_i) 和 (\hat A_i)** 完整实现了。
+
+---
+
+## Step 4：Loss `_compute_loss_and_metrics` —— 把论文的式子翻译成代码
+
+你现在有：
+
+* `inputs` 字典，包含：
+
+  * `input_ids`, `attention_mask`
+  * `completion_mask`, `logits_to_keep`
+  * `old_per_token_logps`, `ref_per_token_logps`
+  * `advantages`
+* 模型 `policy_model`
+
+在 `_compute_loss_and_metrics` 里：
+
+1. 用当前模型再算一遍 per-token logprob：
+
+   ```python
+   per_token_logps, _ = self._get_per_token_logps_and_entropies(model, inputs, compute_entropy=False)
+   ```
+
+2. 拿出 old 的 logprob 和 advantage：
+
+   ```python
+   advantages = inputs['advantages']                        # [B]
+   old_per_token_logps = inputs['old_per_token_logps']      # [B, T]
+   log_ratio = per_token_logps - old_per_token_logps        # [B, T]
+   ratio = torch.exp(log_ratio)                             # [B, T]
+   ```
+
+3. 实现 clipped objective：
+
+   ```python
+   advantages_expanded = advantages.unsqueeze(1)            # [B, 1] -> [B, T] 通过广播
+   coef_1 = ratio
+   coef_2 = torch.clamp(ratio, 1-self.epsilon_low, 1+self.epsilon_high)
+
+   per_token_loss1 = coef_1 * advantages_expanded
+   per_token_loss2 = coef_2 * advantages_expanded
+   per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+   ```
+
+4. KL 惩罚：
+
+   ```python
+   if self.beta != 0.0:
+       ref_per_token_logps = inputs['ref_per_token_logps']
+       per_token_kl = (torch.exp(ref_per_token_logps - per_token_logps)
+                       - (ref_per_token_logps - per_token_logps) - 1)
+       per_token_loss = per_token_loss + self.beta * per_token_kl
+   ```
+
+5. mask & reduce：
+
+   ```python
+   completion_mask = inputs['completion_mask']  # [B, T]
+   loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+   ```
+
+6. 返回 loss：
+
+   ```python
+   return loss, metrics_data
+   ```
+
+这个部分**是最值得你自己手写一遍推导+实现**的地方，你就对照论文把每个变量在代码里找一遍，然后写出一个“只支持 GRPO / importance_sampling_level='token' / 不带 entropy / 不带 rollout IS”的版本，跑通后再慢慢加功能。
+
+---
+
+## Step 5：再回头加 multi-step（μ）和 RepeatSampler / _buffered_inputs
+
+当 Step 1–4 跑稳以后，你再回来加「一次 rollout 更新 μ 次」这部分：
+
+1. `_prepare_algorithm_params`：
+
+   * 加 `self.num_iterations = args.num_iterations`。
+
+2. `_get_train_sampler`：
+
+   * 使用 `RepeatSampler` 或者你自己的版本，让每个数据样本会被重复送进 `_prepare_inputs` 多次。
+
+3. `_prepare_inputs`：
+
+   * 用 `_buffered_inputs` 和 `self._step` 控制：
+
+     * 每 `generate_every = num_rollout_samples * num_iterations` 步重新 rollout；
+     * 中间步骤都复用同一批 rollout。
+
+这一步加完后，你的 trainer 就不再是“PPO 一次 rollout 一次更新”，而是“GRPO 多步更新模式”。
+
+---
+
+## 如果你懒得想，从 0 开始写的实际顺序可以是：
+
+1. **先写 Step 4 的 `_compute_loss_and_metrics`，假设你已经有：**
+
+   * `input_ids`, `attention_mask`, `completion_mask`, `old_per_token_logps`, `ref_per_token_logps`, `advantages`
+   * 手动构造一个 toy batch，跑一遍 loss 看 shape / 数值对不对。
+2. **再写 `_prepare_batch_inputs`，确保能从 messages → tokens → old/ref logprob + completion_mask。**
+3. **再写 `_compute_advantages`，从假定的 rewards 向量算出 advantages。**
+4. **再写 `_score_completions` 和 `_generate_completions`，从 prompts → completions → rewards。**
+5. **最后写 `_prepare_inputs` 和 multi-step 逻辑，把 rollout 和 loss 串起来。**
+
+这样每一步你都可以在 notebook 里用假数据单独测试，不会一上来就被一坨 1000 行 trainer 代码吓晕。
